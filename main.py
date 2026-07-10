@@ -7,9 +7,11 @@ import os
 import random
 from typing import Literal, Optional
 import aiohttp
+import re
 
 load_dotenv() # load environment variable file
 token = os.getenv('DISCORD_TOKEN')
+mw_api_key = os.getenv('MW_API_KEY')
 
 handler = logging.FileHandler(filename='discord.log', encoding='utf-8', mode='w') # w: write mode
 intents = discord.Intents.all()
@@ -117,19 +119,38 @@ async def punch (ctx, user: discord.User):
 
 @punch.error
 async def punch_error(ctx, error):
-    if isinstance(error, (commands.MemberNotFound, commands.UserNotFound)):
+    error = getattr(error, "original", error)
+    if isinstance(error, (commands.MemberNotFound, commands.UserNotFound, app_commands.TransformerError)):
         await ctx.send("That is not a valid user!")
+    else:
+        raise error
 
 judgements = ["is cool", "is not cool", "is gay", "is straight (derogatory)", "is mean", "is Satan", "is God",
               "is nice"]
+mention_pattern = re.compile(r'^<@!?(\d+)>$')
 
 @bot.hybrid_command(description="Judges a person.")
 @app_commands.describe(
-    person="The person you want to judge",
+    person="The person you want to judge (mention them with @ or just type anything)",
 )
 async def judge(ctx, *, person: str):
     judgment = random.choice(judgements)
-    await ctx.send(f"{person} {judgment}")
+
+    match = mention_pattern.match(person.strip())
+    if match:
+        user_id = int(match.group(1))
+        user = ctx.bot.get_user(user_id)
+        if user is None:
+            try:
+                user = await ctx.bot.fetch_user(user_id)
+            except (discord.NotFound, discord.HTTPException):
+                user = None
+        target = user.mention if user else person
+    else:
+        target = person
+
+    await ctx.send(f"{target} {judgment}")
+
 
 # extra features
 def parse_modifier(mod_str):
@@ -152,7 +173,40 @@ async def roll(ctx, dice: str, *, modifier: str = None):
     try:
         rolls, limit = map(int, dice.split('d'))
     except Exception:
-        await ctx.send('Format has to be in NdN, e.g. 2d6')
+        await ctx.send("Format has to be in NdN")
+        return
+
+    results = [random.randint(1, limit) for _ in range(rolls)]
+    result_string = ", ".join(map(str, results))
+    total = sum(results)
+
+    if modifier:
+        try:
+            mod_rolls = parse_modifier(modifier)
+            mod_string = ", ".join(map(str, mod_rolls))
+            mod_total = sum(mod_rolls)
+
+            final_total = total + mod_total
+            sign = "+" if mod_total > 0 else ""
+
+            await ctx.send(f"Rolls: {result_string} (sum: {total})\n"
+                           f"Modifier: {mod_string} ({sign}{mod_total})\n"
+                           f"**Final: {final_total}**")
+        except Exception:
+            await ctx.send("Modifier must be a number or NdN")
+    else:
+        await ctx.send(f"**{result_string}** (sum: {total})")
+    
+@bot.hybrid_command(name="roll-multiple", description="Rolls multiple dice and returns them as a separate values")
+@app_commands.describe(
+    dice="Dice to roll, e.g. 2d6",
+    modifier="Optional modifier, e.g. +3 or 1d4"
+)
+async def roll_multiple(ctx, dice: str, *, modifier: str = None):
+    try:
+        rolls, limit = map(int, dice.split('d'))
+    except Exception:
+        await ctx.send("Format has to be in NdN")
         return
 
     results = [random.randint(1, limit) for _ in range(rolls)]
@@ -168,9 +222,8 @@ async def roll(ctx, dice: str, *, modifier: str = None):
             modified_string = ", ".join(map(str, modified_results))
 
             sign = "+" if mod_total > 0 else ""
-            await ctx.send(f"{result_string}\n"
+            await ctx.send(f"Unmodified: {result_string}\n"
                            f"Modifier: {mod_string} ({sign}{mod_total})\n"
-                           f"Unmodified: {result_string}\n"
                            f"**Final: {modified_string}**")
         except Exception:
             await ctx.send('Modifier must be a number or NdN')
@@ -216,60 +269,89 @@ async def magic8ball(ctx, *, question: str):
     response = random.choice(magic8ball_replies)
     await ctx.send(f"**Q:** {question}\n**A:** {response}")
 
-# thank you https://dictionaryapi.dev/
-@bot.hybrid_command(description="Gets the definition of a word.")
+# thank you Merriam-Webster
+@bot.hybrid_command(description="Gets the Merriam-Webster definition of a word.")
 @app_commands.describe(word="The word you want defined")
 async def define(ctx, *, word: str):
-    url = f"https://api.dictionaryapi.dev/api/v2/entries/en/{word}"
+    url = f"https://www.dictionaryapi.com/api/v3/references/collegiate/json/{word}"
+    params = {"key": mw_api_key}
 
     async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
+        async with session.get(url, params=params) as resp:
             if resp.status != 200:
                 await ctx.send(f"No definition found for **{word}**.")
                 return
             data = await resp.json()
 
-    entry = data[0]
-    output = f"**{entry['word']}**\n"
+    if not data:
+        await ctx.send(f"No definition found for **{word}**.")
+        return
+
+    # If the API couldn't find the word, it returns a list of suggested spellings (strings) instead of entries (dicts)
+    if isinstance(data[0], str):
+        suggestions = ", ".join(data[:5])
+        await ctx.send(f"Couldn't find **{word}**. Did you mean: {suggestions}?")
+        return
+
+    output = f"**{word}**\n"
     def_count = 1
 
-    for meaning in entry.get("meanings", []):
-        part_of_speech = meaning.get("partOfSpeech", "unknown")
-        for definition in meaning.get("definitions", []):
-            line = f"definition {def_count} ({part_of_speech}): {definition['definition']}\n"
-            if definition.get("example"):
-                line += f"  example: {definition['example']}\n"
-            output += line
+    for entry in data:
+        # Skip entries for unrelated words (e.g. "minion's" showing up under "minion")
+        entry_id = entry.get("meta", {}).get("id", "")
+        if entry_id.split(":")[0].lower() != word.lower():
+            continue
+
+        part_of_speech = entry.get("fl", "unknown")
+        for short_def in entry.get("shortdef", []):
+            output += f"**definition {def_count} ({part_of_speech}):** {short_def}\n"
             def_count += 1
+
+    if def_count == 1:
+        output = f"No definition found for **{word}**."
 
     if len(output) > 1990:
         output = output[:1990] + "..."
 
-    await ctx.send(output)
+    await ctx.send(output.strip())
 
 # coda utils
 # credit to aspyn
 def owner_check(interaction: discord.Interaction) -> bool:
     return interaction.user.id == interaction.client.owner_id
 
-@bot.tree.command(name="get-username", description="Gets Coda's usernames/IDs for other platforms")
-@app_commands.describe(platform="Which platform?", hidden="Hide from others?")
+@bot.tree.command(name="get-username", description="Gets Coda's usernames/IDs for other games")
+@app_commands.describe(game="Which game?", hidden="Hide from others?")
 @app_commands.check(owner_check)
-@app_commands.choices(platform=[
+@app_commands.choices(game=[
     app_commands.Choice(name="Honkai Star Rail", value="622852360"),
-    app_commands.Choice(name="Nintendo Switch", value="Sw-0302-3963-0622"),
     app_commands.Choice(name="Minion Rush", value="155F3D"),
+    app_commands.Choice(name="Nintendo Switch", value="SW-0302-3963-0622"),
     app_commands.Choice(name="Pokémon GO", value="449971039763"),
     app_commands.Choice(name="Steam", value="1272623780")
 ])
 
-async def get_username(interaction: discord.Interaction, platform: app_commands.Choice[str], hidden: bool = True):
-    embed = discord.Embed(title=f"{platform.name} user", description=platform.value, color=discord.Colour.random())
+async def get_username(interaction: discord.Interaction, game: app_commands.Choice[str], hidden: bool = True):
+    embed = discord.Embed(title=f"{game.name} user", description=game.value, color=discord.Colour.random())
     await interaction.response.send_message(embed=embed, ephemeral=hidden)
 
-@get_username.error
-async def get_username_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+@bot.tree.command(name="get-socials", description="Get Coda's social media profiles")
+@app_commands.describe(platform="Which platform?", hidden="Hide from others?")
+@app_commands.check(owner_check)
+@app_commands.choices(platform=[
+    app_commands.Choice(name="Letterboxd", value="https://boxd.it/49VQj"),
+    app_commands.Choice(name="TikTok", value="https://www.tiktok.com/@coda0666?_r=1&_t=ZT-97uGGswssOr"),
+    app_commands.Choice(name="Twitter", value="https://x.com/minionyaoilover?s=11")
+])
+
+async def get_socials(interaction: discord.Interaction, platform: app_commands.Choice[str], hidden: bool = True):
+    await interaction.response.send_message(platform.value, ephemeral=hidden)
+
+async def get_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.CheckFailure):
         await interaction.response.send_message("You don't get to access this super secret information about Coda", ephemeral=True)
+
+get_username.error(get_error)
+get_socials.error(get_error)
 
 bot.run(token, log_handler=handler, log_level=logging.DEBUG)
